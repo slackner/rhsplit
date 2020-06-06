@@ -15,7 +15,7 @@
 static const int verbose = 0;
 
 #define AVG_BLOCK_SIZE 0x100000
-#define MIN_BLOCK_SIZE (AVG_BLOCK_SIZE / 2)
+#define MIN_BLOCK_SIZE (AVG_BLOCK_SIZE / 4)
 
 struct direntry
 {
@@ -446,21 +446,24 @@ int main(int argc, char *argv[])
 
             rhash_init(&rhash);
             SHA256_Init(&sha256);
+            out_len = 0;
         }
 
-        len = read - start;
-        SHA256_Update(&sha256, &buf[start], len);
-        if (fwrite(&buf[start], len, 1, out) != 1)
+        if ((len = read - start))
         {
-            fprintf(stderr, "fwrite failed\n");
-            /* FIXME: Cleanup */
-            return 1;
+            SHA256_Update(&sha256, &buf[start], len);
+            if (fwrite(&buf[start], len, 1, out) != 1)
+            {
+                fprintf(stderr, "fwrite failed\n");
+                /* FIXME: Cleanup */
+                return 1;
+            }
+            out_len += len;
         }
-        out_len += len;
     }
 
     fflush(out);
-    if (link_file(base_fd, &files, fileno(out), &sha256, script))
+    if (out_len && link_file(base_fd, &files, fileno(out), &sha256, script))
     {
         /* FIXME: Cleanup */
         return 1;
