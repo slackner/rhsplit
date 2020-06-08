@@ -62,7 +62,6 @@ static inline int rhash_update(struct rhash *rhash, uint8_t value)
 {
     uint8_t old_value;
     uint32_t rh;
-    int i;
 
     if (rhash->len < sizeof(rhash->buf))
     {
@@ -297,6 +296,16 @@ static void unlink_files(int base_fd, struct list *files)
     }
 }
 
+static void free_files(struct list *files)
+{
+    struct direntry *entry, *entry2;
+
+    LIST_FOR_EACH_SAFE(entry, entry2, files, struct direntry, entry)
+    {
+        free(entry);
+    }
+}
+
 static int read_directory(int base_fd, struct list *files)
 {
     struct dirent *dirent;
@@ -360,7 +369,8 @@ int main(int argc, char *argv[])
     uint8_t buf[40960];
     struct rhash rhash;
     SHA256_CTX sha256;
-    FILE *script, *out;
+    FILE *script = NULL;
+    FILE *out = NULL;
     int base_fd;
 
     if (argc != 2)
@@ -377,24 +387,13 @@ int main(int argc, char *argv[])
 
     list_init(&files);
     if (read_directory(base_fd, &files))
-    {
-        close(base_fd);
-        return 1;
-    }
+        goto error;
 
     if (!(script = open_script(base_fd)))
-    {
-        /* FIXME: free linked list */
-        close(base_fd);
-        return 1;
-    }
+        goto error;
 
     if (!(out = open_tempfile(base_fd)))
-    {
-        /* FIXME: free linked list */
-        close(base_fd);
-        return 1;
-    }
+        goto error;
 
     rhash_init(&rhash);
     SHA256_Init(&sha256);
@@ -413,8 +412,7 @@ int main(int argc, char *argv[])
             if (fwrite(&buf[start], len, 1, out) != 1)
             {
                 fprintf(stderr, "fwrite failed\n");
-                /* FIXME: Cleanup */
-                return 1;
+                goto error;
             }
             out_len += i;
             start = i + 1;
@@ -426,17 +424,11 @@ int main(int argc, char *argv[])
 
             fflush(out);
             if (link_file(base_fd, &files, fileno(out), &sha256, script))
-            {
-                /* FIXME: Cleanup */
-                return 1;
-            }
+                goto error;
             fclose(out);
 
             if (!(out = open_tempfile(base_fd)))
-            {
-                /* FIXME: Cleanup */
-                return 1;
-            }
+                goto error;
 
             rhash_init(&rhash);
             SHA256_Init(&sha256);
@@ -449,8 +441,7 @@ int main(int argc, char *argv[])
             if (fwrite(&buf[start], len, 1, out) != 1)
             {
                 fprintf(stderr, "fwrite failed\n");
-                /* FIXME: Cleanup */
-                return 1;
+                goto error;
             }
             out_len += len;
         }
@@ -458,10 +449,7 @@ int main(int argc, char *argv[])
 
     fflush(out);
     if (out_len && link_file(base_fd, &files, fileno(out), &sha256, script))
-    {
-        /* FIXME: Cleanup */
-        return 1;
-    }
+        goto error;
     fclose(out);
 
     fflush(script);
@@ -470,4 +458,11 @@ int main(int argc, char *argv[])
     unlink_files(base_fd, &files);
     close(base_fd);
     return 0;
+
+error:
+    if (out) fclose(out);
+    if (script) fclose(script);
+    free_files(&files);
+    close(base_fd);
+    return 1;
 }
