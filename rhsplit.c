@@ -25,6 +25,13 @@ struct direntry
     char name[0];
 };
 
+struct tempfile
+{
+    SHA256_CTX sha256;
+    FILE *file;
+    size_t len;
+};
+
 struct rhash
 {
     uint8_t buf[4096];
@@ -132,26 +139,60 @@ static FILE *open_script(int base_fd)
     return file;
 }
 
-static FILE *open_tempfile(int base_fd)
+static struct tempfile *open_tempfile(int base_fd)
 {
-    FILE *file;
+    struct tempfile *tempfile;
     int fd;
+
+    if (!(tempfile = malloc(sizeof(*tempfile))))
+    {
+        perror("malloc");
+        return NULL;
+    }
 
     if ((fd = openat(base_fd, ".", O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR)) == -1)
     {
         perror("open");
+        free(tempfile);
         return NULL;
     }
 
-    if (!(file = fdopen(fd, "wb+")))
+    if (!(tempfile->file = fdopen(fd, "wb+")))
     {
         perror("fdopen");
         close(fd);
+        free(tempfile);
         return NULL;
     }
 
-    assert(fileno(file) == fd);
-    return file;
+    SHA256_Init(&tempfile->sha256);
+    tempfile->len = 0;
+
+    return tempfile;
+}
+
+static int tempfile_write(struct tempfile *tempfile, uint8_t *buf, size_t len)
+{
+    if (!len)
+        return 0;
+
+    SHA256_Update(&tempfile->sha256, buf, len);
+    if (fwrite(buf, len, 1, tempfile->file) != 1)
+    {
+        fprintf(stderr, "fwrite failed\n");
+        return -1;
+    }
+    tempfile->len += len;
+    return 0;
+}
+
+static void tempfile_free(struct tempfile *tempfile)
+{
+    if (!tempfile)
+        return;
+
+    fclose(tempfile->file);
+    free(tempfile);
 }
 
 static DIR *opendirat(int dir_fd, char const *path)
@@ -364,13 +405,12 @@ static int read_directory(int base_fd, struct list *files)
 
 int main(int argc, char *argv[])
 {
-    size_t read, start, i, len, out_len;
+    size_t read, start, i;
     struct list files;
     uint8_t buf[40960];
     struct rhash rhash;
-    SHA256_CTX sha256;
     FILE *script = NULL;
-    FILE *out = NULL;
+    struct tempfile *out = NULL;
     int base_fd;
 
     if (argc != 2)
@@ -396,8 +436,6 @@ int main(int argc, char *argv[])
         goto error;
 
     rhash_init(&rhash);
-    SHA256_Init(&sha256);
-    out_len = 0;
 
     while ((read = fread(buf, 1, sizeof(buf), stdin)))
     {
@@ -407,50 +445,34 @@ int main(int argc, char *argv[])
             if (!rhash_update(&rhash, buf[i]))
                 continue;
 
-            len = i + 1 - start;
-            SHA256_Update(&sha256, &buf[start], len);
-            if (fwrite(&buf[start], len, 1, out) != 1)
-            {
-                fprintf(stderr, "fwrite failed\n");
+            if (tempfile_write(out, &buf[start], i + 1 - start))
                 goto error;
-            }
-            out_len += len;
             start = i + 1;
 
-            if (out_len < MIN_BLOCK_SIZE)
+            if (out->len < MIN_BLOCK_SIZE)
                 continue;
 
             /* Flush output, start a new file */
 
-            fflush(out);
-            if (link_file(base_fd, &files, fileno(out), &sha256, script))
+            fflush(out->file);
+            if (link_file(base_fd, &files, fileno(out->file), &out->sha256, script))
                 goto error;
-            fclose(out);
+            tempfile_free(out);
 
             if (!(out = open_tempfile(base_fd)))
                 goto error;
 
             rhash_init(&rhash);
-            SHA256_Init(&sha256);
-            out_len = 0;
         }
 
-        if ((len = read - start))
-        {
-            SHA256_Update(&sha256, &buf[start], len);
-            if (fwrite(&buf[start], len, 1, out) != 1)
-            {
-                fprintf(stderr, "fwrite failed\n");
-                goto error;
-            }
-            out_len += len;
-        }
+        if (tempfile_write(out, &buf[start], read - start))
+            goto error;
     }
 
-    fflush(out);
-    if (out_len && link_file(base_fd, &files, fileno(out), &sha256, script))
+    fflush(out->file);
+    if (out->len && link_file(base_fd, &files, fileno(out->file), &out->sha256, script))
         goto error;
-    fclose(out);
+    tempfile_free(out);
 
     fflush(script);
     fclose(script);
@@ -460,8 +482,8 @@ int main(int argc, char *argv[])
     return 0;
 
 error:
-    if (out) fclose(out);
     if (script) fclose(script);
+    tempfile_free(out);
     free_files(&files);
     close(base_fd);
     return 1;
