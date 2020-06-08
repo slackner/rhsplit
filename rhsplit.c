@@ -12,6 +12,8 @@
 #include <string.h>
 #include <stddef.h>
 
+#include "list.h"
+
 static const int verbose = 0;
 
 #define AVG_BLOCK_SIZE 0x100000
@@ -19,7 +21,7 @@ static const int verbose = 0;
 
 struct direntry
 {
-    struct direntry *next;
+    struct list entry;
     char name[0];
 };
 
@@ -218,14 +220,14 @@ static int check_file(int base_fd, char *name)
     return -1;
 }
 
-static int link_file(int base_fd, struct direntry **files, int fd, SHA256_CTX *sha256, FILE *script)
+static int link_file(int base_fd, struct list *files, int fd, SHA256_CTX *sha256, FILE *script)
 {
     static const char cmd_prefix[] = "cat ";
     static const char cmd_suffix[] = "\n";
     unsigned char digest[SHA256_DIGEST_LENGTH + 1];
     char name[SHA256_DIGEST_LENGTH * 2 + 1];
     char proc_path[PATH_MAX];
-    struct direntry **entry;
+    struct direntry *entry;
     char *ptr;
     int i;
 
@@ -246,14 +248,12 @@ static int link_file(int base_fd, struct direntry **files, int fd, SHA256_CTX *s
         return -1;
     }
 
-    entry = files;
-    while (*entry)
+    LIST_FOR_EACH(entry, files, struct direntry, entry)
     {
-        if (!strcmp((*entry)->name, name))
+        if (!strcmp(entry->name, name))
         {
-            struct direntry *old_entry = *entry;
-            *entry = (*entry)->next;
-            free(old_entry);
+            list_remove(&entry->entry);
+            free(entry);
 
             if (!check_file(base_fd, name))
             {
@@ -265,8 +265,6 @@ static int link_file(int base_fd, struct direntry **files, int fd, SHA256_CTX *s
             unlinkat(base_fd, name, 0);
             break;
         }
-
-        entry = &(*entry)->next;
     }
 
     sprintf(proc_path, "/proc/self/fd/%d", fd);
@@ -287,23 +285,19 @@ static int link_file(int base_fd, struct direntry **files, int fd, SHA256_CTX *s
     return 0;
 }
 
-static void unlink_files(int base_fd, struct direntry **files)
+static void unlink_files(int base_fd, struct list *files)
 {
-    struct direntry *entry, *next;
+    struct direntry *entry, *entry2;
 
-    while ((entry = *files))
+    LIST_FOR_EACH_SAFE(entry, entry2, files, struct direntry, entry)
     {
-        next = entry->next;
-
         if (verbose) fprintf(stderr, "%s: deleting\n", entry->name);
         unlinkat(base_fd, entry->name, 0);
         free(entry);
-
-        *files = next;
     }
 }
 
-static int read_directory(int base_fd, struct direntry **files)
+static int read_directory(int base_fd, struct list *files)
 {
     struct dirent *dirent;
     struct direntry *entry;
@@ -352,8 +346,7 @@ static int read_directory(int base_fd, struct direntry **files)
         }
 
         strcpy(entry->name, name);
-        entry->next = *files;
-        *files = entry;
+        list_add_tail(files, &entry->entry);
     }
 
     closedir(dir);
@@ -363,7 +356,7 @@ static int read_directory(int base_fd, struct direntry **files)
 int main(int argc, char *argv[])
 {
     size_t read, start, i, len, out_len;
-    struct direntry *files = NULL;
+    struct list files;
     uint8_t buf[40960];
     struct rhash rhash;
     SHA256_CTX sha256;
@@ -382,6 +375,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    list_init(&files);
     if (read_directory(base_fd, &files))
     {
         close(base_fd);
