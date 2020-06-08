@@ -414,7 +414,7 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "fwrite failed\n");
                 goto error;
             }
-            out_len += i;
+            out_len += len;
             start = i + 1;
 
             if (out_len < MIN_BLOCK_SIZE)
