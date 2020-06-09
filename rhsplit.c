@@ -260,7 +260,7 @@ static int check_file(int base_fd, char *name)
     return -1;
 }
 
-static int link_file(int base_fd, struct list *files, int fd, SHA256_CTX *sha256, FILE *script)
+static int tempfile_finish(struct tempfile *tempfile, int base_fd, struct list *files, FILE *script)
 {
     static const char cmd_prefix[] = "cat ";
     static const char cmd_suffix[] = "\n";
@@ -271,7 +271,11 @@ static int link_file(int base_fd, struct list *files, int fd, SHA256_CTX *sha256
     char *ptr;
     int i;
 
-    SHA256_Final(digest, sha256);
+    if (!tempfile->len)
+        return 0;
+
+    fflush(tempfile->file);
+    SHA256_Final(digest, &tempfile->sha256);
 
     ptr = name;
     for (i = 0; i < SHA256_DIGEST_LENGTH; i++)
@@ -307,7 +311,7 @@ static int link_file(int base_fd, struct list *files, int fd, SHA256_CTX *sha256
         }
     }
 
-    sprintf(proc_path, "/proc/self/fd/%d", fd);
+    sprintf(proc_path, "/proc/self/fd/%d", fileno(tempfile->file));
     if (linkat(AT_FDCWD, proc_path, base_fd, name, AT_SYMLINK_FOLLOW))
     {
         if (errno == EEXIST)
@@ -454,8 +458,7 @@ int main(int argc, char *argv[])
 
             /* Flush output, start a new file */
 
-            fflush(out->file);
-            if (link_file(base_fd, &files, fileno(out->file), &out->sha256, script))
+            if (tempfile_finish(out, base_fd, &files, script))
                 goto error;
             tempfile_free(out);
 
@@ -469,8 +472,7 @@ int main(int argc, char *argv[])
             goto error;
     }
 
-    fflush(out->file);
-    if (out->len && link_file(base_fd, &files, fileno(out->file), &out->sha256, script))
+    if (tempfile_finish(out, base_fd, &files, script))
         goto error;
     tempfile_free(out);
 
