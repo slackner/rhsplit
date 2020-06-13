@@ -11,10 +11,11 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <stddef.h>
+#include <zlib.h>
 
 #include "list.h"
 
-static const int verbose = 0;
+static int verbose = 0;
 
 #define AVG_BLOCK_SIZE 0x100000
 #define MIN_BLOCK_SIZE (AVG_BLOCK_SIZE / 4)
@@ -22,14 +23,23 @@ static const int verbose = 0;
 struct direntry
 {
     struct list entry;
+    int compressed;  /* the file appears to be compressed */
+    int keep;  /* keep the file after the script completes */
     char name[0];
 };
 
 struct tempfile
 {
     SHA256_CTX sha256;
-    FILE *file;
     size_t len;
+
+    /* uncompressed file */
+    int fd;
+    FILE *file;
+
+    /* compressed file */
+    int gzfd;
+    gzFile gzfile;
 };
 
 struct rhash
@@ -139,7 +149,19 @@ static FILE *open_script(int base_fd)
     return file;
 }
 
-static struct tempfile *open_tempfile(int base_fd)
+static void tempfile_free(struct tempfile *tempfile)
+{
+    if (!tempfile)
+        return;
+
+    if (tempfile->fd != -1) close(tempfile->fd);
+    if (tempfile->file) fclose(tempfile->file);
+    if (tempfile->gzfd != -1) close(tempfile->gzfd);
+    if (tempfile->gzfile) gzclose(tempfile->gzfile);
+    free(tempfile);
+}
+
+static struct tempfile *open_tempfile(int base_fd, int compression)
 {
     struct tempfile *tempfile;
     int fd;
@@ -150,25 +172,61 @@ static struct tempfile *open_tempfile(int base_fd)
         return NULL;
     }
 
-    if ((fd = openat(base_fd, ".", O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR)) == -1)
+    tempfile->fd = -1;
+    tempfile->file = NULL;
+    tempfile->gzfd = -1;
+    tempfile->gzfile = NULL;
+
+    if (compression <= 1)
     {
-        perror("open");
-        free(tempfile);
-        return NULL;
+        if ((fd = openat(base_fd, ".", O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR)) == -1)
+        {
+            perror("open");
+            goto error;
+        }
+        if ((tempfile->fd = dup(fd)) == -1)
+        {
+            perror("dup");
+            close(fd);
+            goto error;
+        }
+        if (!(tempfile->file = fdopen(fd, "wb")))
+        {
+            perror("fdopen");
+            close(fd);
+            goto error;
+        }
     }
 
-    if (!(tempfile->file = fdopen(fd, "wb+")))
+    if (compression >= 1)
     {
-        perror("fdopen");
-        close(fd);
-        free(tempfile);
-        return NULL;
+        if ((fd = openat(base_fd, ".", O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR)) == -1)
+        {
+            perror("open");
+            goto error;
+        }
+        if ((tempfile->gzfd = dup(fd)) == -1)
+        {
+            perror("dup");
+            close(fd);
+            goto error;
+        }
+        if (!(tempfile->gzfile = gzdopen(fd, "wb")))
+        {
+            perror("gzdopen");
+            close(fd);
+            goto error;
+        }
     }
 
     SHA256_Init(&tempfile->sha256);
     tempfile->len = 0;
 
     return tempfile;
+
+error:
+    tempfile_free(tempfile);
+    return NULL;
 }
 
 static int tempfile_write(struct tempfile *tempfile, uint8_t *buf, size_t len)
@@ -176,23 +234,20 @@ static int tempfile_write(struct tempfile *tempfile, uint8_t *buf, size_t len)
     if (!len)
         return 0;
 
-    SHA256_Update(&tempfile->sha256, buf, len);
-    if (fwrite(buf, len, 1, tempfile->file) != 1)
+    if (tempfile->file && fwrite(buf, len, 1, tempfile->file) != 1)
     {
         fprintf(stderr, "fwrite failed\n");
         return -1;
     }
+    if (tempfile->gzfile && gzfwrite(buf, len, 1, tempfile->gzfile) != 1)
+    {
+        fprintf(stderr, "gzwrite failed\n");
+        return -1;
+    }
+
+    SHA256_Update(&tempfile->sha256, buf, len);
     tempfile->len += len;
     return 0;
-}
-
-static void tempfile_free(struct tempfile *tempfile)
-{
-    if (!tempfile)
-        return;
-
-    fclose(tempfile->file);
-    free(tempfile);
 }
 
 static DIR *opendirat(int dir_fd, char const *path)
@@ -214,67 +269,136 @@ static DIR *opendirat(int dir_fd, char const *path)
     return dir;
 }
 
-static int check_file(int base_fd, char *name)
+static int check_file(int base_fd, char *name, unsigned char *expected_digest)
 {
-    unsigned char digest[SHA256_DIGEST_LENGTH + 1];
-    char new_name[SHA256_DIGEST_LENGTH * 2 + 1];
+    unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256_CTX sha256;
     char buf[40960];
-    char *ptr;
     size_t read;
     FILE *file;
     int fd;
-    int i;
 
     if ((fd = openat(base_fd, name, O_RDONLY, S_IRUSR | S_IWUSR)) == -1)
     {
         perror("openat");
-        return -1;
+        return 0;
     }
-
     if (!(file = fdopen(fd, "rb")))
     {
         perror("fdopen");
         close(fd);
-        return -1;
+        return 0;
     }
 
     SHA256_Init(&sha256);
     while ((read = fread(buf, 1, sizeof(buf), file)))
         SHA256_Update(&sha256, buf, read);
 
+    if (ferror(file))
+    {
+        fprintf(stderr, "%s: Error while reading file\n", name);
+        fclose(file);
+        return 0;
+    }
+
     SHA256_Final(digest, &sha256);
     fclose(file);
 
-    ptr = new_name;
-    for (i = 0; i < SHA256_DIGEST_LENGTH; i++)
-    {
-        sprintf(ptr, "%02x", digest[i]);
-        ptr += 2;
-    }
-
-    if (!strcmp(name, new_name))
-        return 0;
+    if (!memcmp(digest, expected_digest, sizeof(digest)))
+        return 1;
 
     if (verbose) fprintf(stderr, "%s: Checksum mismatch\n", name);
-    return -1;
+    return 0;
+}
+
+static int check_gzfile(int base_fd, char *name, unsigned char *expected_digest)
+{
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256_CTX sha256;
+    char buf[40960];
+    int errnum = 0;
+    size_t read;
+    gzFile file;
+    int fd;
+
+    if ((fd = openat(base_fd, name, O_RDONLY, S_IRUSR | S_IWUSR)) == -1)
+    {
+        perror("openat");
+        return 0;
+    }
+    if (!(file = gzdopen(fd, "rb")))
+    {
+        perror("gzdopen");
+        close(fd);
+        return 0;
+    }
+
+    if (gzdirect(file))
+    {
+        fprintf(stderr, "%s: File is not gzip compressed\n", name);
+        gzclose(file);
+        return 0;
+    }
+
+    SHA256_Init(&sha256);
+    while ((read = gzfread(buf, 1, sizeof(buf), file)))
+        SHA256_Update(&sha256, buf, read);
+
+    gzerror(file, &errnum);
+    if (errnum)
+    {
+        fprintf(stderr, "%s: Error while reading file\n", name);
+        gzclose(file);
+        return 0;
+    }
+
+    SHA256_Final(digest, &sha256);
+    gzclose(file);
+
+    if (!memcmp(digest, expected_digest, sizeof(digest)))
+        return 1;
+
+    if (verbose) fprintf(stderr, "%s: Checksum mismatch\n", name);
+    return 0;
 }
 
 static int tempfile_finish(struct tempfile *tempfile, int base_fd, struct list *files, FILE *script)
 {
-    static const char cmd_prefix[] = "cat ";
-    static const char cmd_suffix[] = "\n";
-    unsigned char digest[SHA256_DIGEST_LENGTH + 1];
-    char name[SHA256_DIGEST_LENGTH * 2 + 1];
+    static const char format_str_gz[] = "zcat %s\n";
+    static const char format_str[] = "cat %s\n";
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    char name[SHA256_DIGEST_LENGTH * 2 + 4];
+    struct direntry *entry, *entry2;
     char proc_path[PATH_MAX];
-    struct direntry *entry;
+    const char *format;
+    int compressed;
     char *ptr;
+    int fd;
     int i;
 
     if (!tempfile->len)
         return 0;
 
-    fflush(tempfile->file);
+    if (tempfile->file)
+    {
+        if (fclose(tempfile->file))
+        {
+            fprintf(stderr, "fclose failed\n");
+            return -1;
+        }
+        tempfile->file = NULL;
+    }
+
+    if (tempfile->gzfile)
+    {
+        if (gzclose(tempfile->gzfile) != Z_OK)
+        {
+            fprintf(stderr, "gzclose failed\n");
+            return -1;
+        }
+        tempfile->gzfile = NULL;
+    }
+
     SHA256_Final(digest, &tempfile->sha256);
 
     ptr = name;
@@ -284,48 +408,89 @@ static int tempfile_finish(struct tempfile *tempfile, int base_fd, struct list *
         ptr += 2;
     }
 
-    if (fwrite(cmd_prefix, strlen(cmd_prefix), 1, script) != 1 ||
-        fwrite(name, strlen(name), 1, script) != 1 ||
-        fwrite(cmd_suffix, strlen(cmd_suffix), 1, script) != 1)
+    LIST_FOR_EACH_SAFE(entry, entry2, files, struct direntry, entry)
     {
-        fprintf(stderr, "fwrite failed\n");
-        return -1;
-    }
+        if (strncmp(entry->name, name, SHA256_DIGEST_LENGTH * 2))
+            continue;
 
-    LIST_FOR_EACH(entry, files, struct direntry, entry)
-    {
-        if (!strcmp(entry->name, name))
+        if (!entry->keep)
         {
-            list_remove(&entry->entry);
-            free(entry);
+            if (entry->compressed)
+                entry->keep = check_gzfile(base_fd, entry->name, digest);
+            else
+                entry->keep = check_file(base_fd, entry->name, digest);
+        }
 
-            if (!check_file(base_fd, name))
+        if (entry->keep)
+        {
+            format = entry->compressed ? format_str_gz : format_str;
+            if (fprintf(script, format, entry->name) < 0)
             {
-                if (verbose) fprintf(stderr, "%s: reusing existing file\n", name);
-                return 0;
+                fprintf(stderr, "fprintf failed\n");
+                return -1;
             }
 
-            /* delete the file and create from scratch */
-            unlinkat(base_fd, name, 0);
-            break;
-        }
-    }
-
-    sprintf(proc_path, "/proc/self/fd/%d", fileno(tempfile->file));
-    if (linkat(AT_FDCWD, proc_path, base_fd, name, AT_SYMLINK_FOLLOW))
-    {
-        if (errno == EEXIST)
-        {
-            /* We must have created it before. This means the checksum has
-             * already been verified. */
+            if (verbose) fprintf(stderr, "%s: Reusing existing file\n", entry->name);
             return 0;
         }
 
+        /* the file is invalid, delete it */
+        if (verbose) fprintf(stderr, "%s: Deleting\n", entry->name);
+        unlinkat(base_fd, entry->name, 0);
+        list_remove(&entry->entry);
+        free(entry);
+    }
+
+    if (tempfile->fd != -1 && tempfile->gzfd != -1)
+    {
+        struct stat stat, gzstat;
+
+        if (fstat(tempfile->fd, &stat) ||
+            fstat(tempfile->gzfd, &gzstat))
+        {
+            perror("fstat");
+            return -1;
+        }
+
+        compressed = (gzstat.st_size + 4096 < stat.st_size);
+    }
+    else
+    {
+        compressed = (tempfile->gzfd != -1);
+    }
+
+    if (compressed)
+        strcat(name, ".gz");
+
+    format = compressed ? format_str_gz : format_str;
+    if (fprintf(script, format, name) < 0)
+    {
+        fprintf(stderr, "fprintf failed\n");
+        return -1;
+    }
+
+    fd = compressed ? tempfile->gzfd : tempfile->fd;
+    sprintf(proc_path, "/proc/self/fd/%d", fd);
+    assert(fd != -1);
+
+    if (linkat(AT_FDCWD, proc_path, base_fd, name, AT_SYMLINK_FOLLOW))
+    {
         perror("linkat");
         return -1;
     }
 
-    if (verbose) fprintf(stderr, "%s: created\n", name);
+    if (!(entry = malloc(offsetof(struct direntry, name[strlen(name) + 1]))))
+    {
+        perror("malloc");
+        return -1;
+    }
+
+    entry->compressed = compressed;
+    entry->keep = 1;
+    strcpy(entry->name, name);
+    list_add_tail(files, &entry->entry);
+
+    if (verbose) fprintf(stderr, "%s: Created\n", name);
     return 0;
 }
 
@@ -335,8 +500,11 @@ static void unlink_files(int base_fd, struct list *files)
 
     LIST_FOR_EACH_SAFE(entry, entry2, files, struct direntry, entry)
     {
-        if (verbose) fprintf(stderr, "%s: deleting\n", entry->name);
-        unlinkat(base_fd, entry->name, 0);
+        if (!entry->keep)
+        {
+            if (verbose) fprintf(stderr, "%s: Deleting\n", entry->name);
+            unlinkat(base_fd, entry->name, 0);
+        }
         free(entry);
     }
 }
@@ -353,9 +521,10 @@ static void free_files(struct list *files)
 
 static int read_directory(int base_fd, struct list *files)
 {
-    struct dirent *dirent;
     struct direntry *entry;
+    struct dirent *dirent;
     const char *name;
+    int compressed;
     DIR *dir;
     int i;
 
@@ -374,22 +543,26 @@ static int read_directory(int base_fd, struct list *files)
         if (!strcmp(name, "unpack"))
             continue;
 
-        if (strlen(name) != SHA256_DIGEST_LENGTH * 2)
-        {
-            fprintf(stderr, "%s: unexpected file\n", name);
-            closedir(dir);
-            return -1;
-        }
-
         for (i = 0; i < SHA256_DIGEST_LENGTH * 2; i++)
         {
             if (!(name[i] >= '0' && name[i] <= '9') &&
                 !(name[i] >= 'a' && name[i] <= 'f'))
             {
-                fprintf(stderr, "%s: unexpected file\n", name);
+                fprintf(stderr, "%s: Unexpected file\n", name);
                 closedir(dir);
                 return -1;
             }
+        }
+
+        if (!strcmp(&name[SHA256_DIGEST_LENGTH * 2], ".gz"))
+            compressed = 1;
+        else if (!name[SHA256_DIGEST_LENGTH * 2])
+            compressed = 0;
+        else
+        {
+            fprintf(stderr, "%s: Unexpected file\n", name);
+            closedir(dir);
+            return -1;
         }
 
         if (!(entry = malloc(offsetof(struct direntry, name[strlen(name) + 1]))))
@@ -399,6 +572,8 @@ static int read_directory(int base_fd, struct list *files)
             return -1;
         }
 
+        entry->compressed = compressed;
+        entry->keep = 0;
         strcpy(entry->name, name);
         list_add_tail(files, &entry->entry);
     }
@@ -409,21 +584,42 @@ static int read_directory(int base_fd, struct list *files)
 
 int main(int argc, char *argv[])
 {
-    size_t read, start, i;
-    struct list files;
-    uint8_t buf[40960];
-    struct rhash rhash;
-    FILE *script = NULL;
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    char name[SHA256_DIGEST_LENGTH * 2 + 1];
+    const char *base_path = NULL;
     struct tempfile *out = NULL;
+    SHA256_CTX sha256;
+    size_t read, start;
+    struct rhash rhash;
+    struct list files;
+    int compression = 0;
+    FILE *script = NULL;
+    int options = 1;
+    uint8_t buf[40960];
     int base_fd;
+    char *ptr;
+    int i;
 
-    if (argc != 2)
+    for (i = 1; i < argc; i++)
+    {
+        if (options && !strcmp(argv[i], "-Z")) compression = 2;
+        else if (options && !strcmp(argv[i], "-z")) compression = 1;
+        else if (options && !strcmp(argv[i], "-v")) verbose = 1;
+        else if (options && !strcmp(argv[i], "--")) options = 0;
+        else if (!base_path) base_path = argv[i];
+        else
+        {
+            fprintf(stderr, "Usage: %s [DIRECTORY]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (!base_path)
     {
         fprintf(stderr, "Usage: %s [DIRECTORY]\n", argv[0]);
         return 1;
     }
-
-    if ((base_fd = open(argv[1], O_DIRECTORY | O_PATH | O_RDWR)) == -1)
+    if ((base_fd = open(base_path, O_DIRECTORY | O_PATH | O_RDWR)) == -1)
     {
         perror("open");
         return 1;
@@ -436,13 +632,16 @@ int main(int argc, char *argv[])
     if (!(script = open_script(base_fd)))
         goto error;
 
-    if (!(out = open_tempfile(base_fd)))
+    if (!(out = open_tempfile(base_fd, compression)))
         goto error;
 
+    SHA256_Init(&sha256);
     rhash_init(&rhash);
 
     while ((read = fread(buf, 1, sizeof(buf), stdin)))
     {
+        SHA256_Update(&sha256, buf, read);
+
         start = 0;
         for (i = 0; i < read; i++)
         {
@@ -451,18 +650,16 @@ int main(int argc, char *argv[])
 
             if (tempfile_write(out, &buf[start], i + 1 - start))
                 goto error;
-            start = i + 1;
 
+            start = i + 1;
             if (out->len < MIN_BLOCK_SIZE)
                 continue;
 
-            /* Flush output, start a new file */
-
             if (tempfile_finish(out, base_fd, &files, script))
                 goto error;
-            tempfile_free(out);
 
-            if (!(out = open_tempfile(base_fd)))
+            tempfile_free(out);
+            if (!(out = open_tempfile(base_fd, compression)))
                 goto error;
 
             rhash_init(&rhash);
@@ -474,10 +671,30 @@ int main(int argc, char *argv[])
 
     if (tempfile_finish(out, base_fd, &files, script))
         goto error;
-    tempfile_free(out);
 
-    fflush(script);
-    fclose(script);
+    tempfile_free(out);
+    out = NULL;
+
+    SHA256_Final(digest, &sha256);
+
+    ptr = name;
+    for (i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    {
+        sprintf(ptr, "%02x", digest[i]);
+        ptr += 2;
+    }
+
+    if (fprintf(script, "\n# SHA256: %s\n", name) < 0)
+    {
+        fprintf(stderr, "fprintf failed\n");
+        goto error;
+    }
+    if (fclose(script))
+    {
+        fprintf(stderr, "fclose failed\n");
+        goto error;
+    }
+    script = NULL;
 
     unlink_files(base_fd, &files);
     close(base_fd);
