@@ -5,7 +5,7 @@ import tempfile
 import hashlib
 import os
 
-COMMAND = ["valgrind", "./rhsplit"]
+COMMAND = ["valgrind", "--leak-check=full", "--error-exitcode=1", "./rhsplit"]
 
 
 class RHSplitTests(unittest.TestCase):
