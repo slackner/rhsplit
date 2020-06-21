@@ -11,16 +11,30 @@ COMMAND = ["valgrind", "--leak-check=full", "--error-exitcode=1", "./rhsplit"]
 class RHSplitTests(unittest.TestCase):
     def test_missing_path(self):
         with self.assertRaises(subprocess.CalledProcessError):
-            subprocess.check_output(COMMAND, input=b"")
+            output = subprocess.check_output(COMMAND, stderr=subprocess.STDOUT)
+            self.assertIn("Usage:", output)
 
         with self.assertRaises(subprocess.CalledProcessError):
-            subprocess.check_output(COMMAND + ["-z"], input=b"")
+            output = subprocess.check_output(COMMAND + ["-z"], stderr=subprocess.STDOUT)
+            self.assertIn("Usage:", output)
 
         with self.assertRaises(subprocess.CalledProcessError):
-            subprocess.check_output(COMMAND + ["-Z"], input=b"")
+            output = subprocess.check_output(COMMAND + ["-Z"], stderr=subprocess.STDOUT)
+            self.assertIn("Usage:", output)
 
         with self.assertRaises(subprocess.CalledProcessError):
-            subprocess.check_output(COMMAND + ["--"], input=b"")
+            output = subprocess.check_output(COMMAND + ["-h"], stderr=subprocess.STDOUT)
+            self.assertIn("Usage:", output)
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            output = subprocess.check_output(COMMAND + ["--"], stderr=subprocess.STDOUT)
+            self.assertIn("Usage:", output)
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            output = subprocess.check_output(
+                COMMAND + ["dir1", "dir2"], stderr=subprocess.STDOUT
+            )
+            self.assertIn("Usage:", output)
 
     def test_nonexistent(self):
         with tempfile.TemporaryDirectory() as temp_path:

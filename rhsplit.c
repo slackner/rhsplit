@@ -582,6 +582,22 @@ static int read_directory(int base_fd, struct list *files)
     return 0;
 }
 
+void show_help(const char *program_name)
+{
+    fprintf(stderr, "Usage: %s [OPTION]... [DIRECTORY]...\n", program_name);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Read large binary files from stdin and split them based on a running hash\n");
+    fprintf(stderr, "function. The parts are stored in DIRECTORY, along with a script to recreate\n");
+    fprintf(stderr, "the original file.\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  -h  show this help\n");
+    fprintf(stderr, "  -v  enable verbose mode\n");
+    fprintf(stderr, "  -z  use gzip compression when it decreases the file size\n");
+    fprintf(stderr, "  -Z  enable gzip compression for all blocks\n");
+    fprintf(stderr, "\n");
+    exit(1);
+}
+
 int main(int argc, char *argv[])
 {
     unsigned char digest[SHA256_DIGEST_LENGTH];
@@ -605,18 +621,15 @@ int main(int argc, char *argv[])
         if (options && !strcmp(argv[i], "-Z")) compression = 2;
         else if (options && !strcmp(argv[i], "-z")) compression = 1;
         else if (options && !strcmp(argv[i], "-v")) verbose = 1;
+        else if (options && !strcmp(argv[i], "-h")) show_help(argv[0]);
         else if (options && !strcmp(argv[i], "--")) options = 0;
         else if (!base_path) base_path = argv[i];
-        else
-        {
-            fprintf(stderr, "Usage: %s [DIRECTORY]\n", argv[0]);
-            return 1;
-        }
+        else show_help(argv[0]);
     }
 
     if (!base_path)
     {
-        fprintf(stderr, "Usage: %s [DIRECTORY]\n", argv[0]);
+        show_help(argv[0]);
         return 1;
     }
     if ((base_fd = open(base_path, O_DIRECTORY | O_PATH | O_RDWR)) == -1)
