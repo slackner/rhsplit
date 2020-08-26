@@ -10,31 +10,31 @@ COMMAND = ["valgrind", "--leak-check=full", "--error-exitcode=1", "./rhsplit"]
 
 class RHSplitTests(unittest.TestCase):
     def test_missing_path(self):
-        with self.assertRaises(subprocess.CalledProcessError):
-            output = subprocess.check_output(COMMAND, stderr=subprocess.STDOUT)
-            self.assertIn("Usage:", output)
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            subprocess.check_output(COMMAND, stderr=subprocess.STDOUT)
+        self.assertIn(b"Usage:", cm.exception.output)
 
-        with self.assertRaises(subprocess.CalledProcessError):
-            output = subprocess.check_output(COMMAND + ["-z"], stderr=subprocess.STDOUT)
-            self.assertIn("Usage:", output)
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            subprocess.check_output(COMMAND + ["-z"], stderr=subprocess.STDOUT)
+        self.assertIn(b"Usage:", cm.exception.output)
 
-        with self.assertRaises(subprocess.CalledProcessError):
-            output = subprocess.check_output(COMMAND + ["-Z"], stderr=subprocess.STDOUT)
-            self.assertIn("Usage:", output)
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            subprocess.check_output(COMMAND + ["-Z"], stderr=subprocess.STDOUT)
+        self.assertIn(b"Usage:", cm.exception.output)
 
-        with self.assertRaises(subprocess.CalledProcessError):
-            output = subprocess.check_output(COMMAND + ["-h"], stderr=subprocess.STDOUT)
-            self.assertIn("Usage:", output)
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            subprocess.check_output(COMMAND + ["-h"], stderr=subprocess.STDOUT)
+        self.assertIn(b"Usage:", cm.exception.output)
 
-        with self.assertRaises(subprocess.CalledProcessError):
-            output = subprocess.check_output(COMMAND + ["--"], stderr=subprocess.STDOUT)
-            self.assertIn("Usage:", output)
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            subprocess.check_output(COMMAND + ["--"], stderr=subprocess.STDOUT)
+        self.assertIn(b"Usage:", cm.exception.output)
 
-        with self.assertRaises(subprocess.CalledProcessError):
-            output = subprocess.check_output(
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            subprocess.check_output(
                 COMMAND + ["dir1", "dir2"], stderr=subprocess.STDOUT
             )
-            self.assertIn("Usage:", output)
+        self.assertIn(b"Usage:", cm.exception.output)
 
     def test_nonexistent(self):
         with tempfile.TemporaryDirectory() as temp_path:
